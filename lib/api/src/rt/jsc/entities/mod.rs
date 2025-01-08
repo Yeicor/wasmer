@@ -2,6 +2,8 @@ pub(crate) mod engine;
 pub(crate) mod external;
 pub(crate) mod function;
 pub(crate) mod global;
+pub(crate) mod tag;
+pub(crate) mod exception;
 pub(crate) mod instance;
 pub(crate) mod memory;
 pub(crate) mod module;

@@ -2,6 +2,8 @@ pub mod engine;
 pub mod external;
 pub mod function;
 pub mod global;
+pub mod tag;
+pub mod exception;
 pub mod instance;
 pub mod memory;
 pub mod module;
