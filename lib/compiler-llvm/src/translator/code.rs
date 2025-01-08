@@ -20,15 +20,13 @@ use inkwell::{
     AddressSpace, AtomicOrdering, AtomicRMWBinOp, DLLStorageClass, FloatPredicate, IntPredicate,
 };
 use smallvec::SmallVec;
+use target_lexicon::BinaryFormat;
 
-use crate::object_file::{load_object_file, CompiledFunction};
 use crate::{
     abi::{get_abi, Abi},
-    error::err,
-};
-use crate::{
     config::{CompiledKind, LLVM},
-    error::err_nt,
+    error::{err, err_nt},
+    object_file::{load_object_file, CompiledFunction},
 };
 use wasmer_compiler::{
     from_binaryreadererror_wasmerror,
@@ -36,7 +34,7 @@ use wasmer_compiler::{
         relocation::RelocationTarget,
         symbols::{Symbol, SymbolRegistry},
     },
-    wasmparser::{MemArg, Operator},
+    wasmparser::{Catch, MemArg, Operator},
     wpheaptype_to_type, wptype_to_type, FunctionBinaryReader, FunctionBodyData,
     MiddlewareBinaryReader, ModuleMiddlewareChain, ModuleTranslationState,
 };
@@ -47,22 +45,39 @@ use wasmer_types::{
 };
 use wasmer_vm::{MemoryStyle, TableStyle, VMOffsets};
 
-const FUNCTION_SECTION: &str = "__TEXT,wasmer_function";
+const FUNCTION_SECTION_ELF: &str = "__TEXT,wasmer_function";
+const FUNCTION_SECTION_MACHO: &str = "wasmer_function";
 
 pub struct FuncTranslator {
     ctx: Context,
     target_machine: TargetMachine,
     abi: Box<dyn Abi>,
+    binary_fmt: BinaryFormat,
+    func_section: String,
 }
 
 impl FuncTranslator {
-    pub fn new(target_machine: TargetMachine) -> Self {
+    pub fn new(
+        target_machine: TargetMachine,
+        binary_fmt: BinaryFormat,
+    ) -> Result<Self, CompileError> {
         let abi = get_abi(&target_machine);
-        Self {
+        Ok(Self {
             ctx: Context::create(),
             target_machine,
             abi,
-        }
+            func_section: match binary_fmt {
+                BinaryFormat::Elf => FUNCTION_SECTION_ELF.to_string(),
+                BinaryFormat::Macho => FUNCTION_SECTION_MACHO.to_string(),
+                _ => {
+                    return Err(CompileError::UnsupportedTarget(format!(
+                        "Unsupported binary format: {:?}",
+                        binary_fmt
+                    )))
+                }
+            },
+            binary_fmt,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -100,7 +115,7 @@ impl FuncTranslator {
 
         // TODO: pointer width
         let offsets = VMOffsets::new(8, wasm_module);
-        let intrinsics = Intrinsics::declare(&module, &self.ctx, &target_data);
+        let intrinsics = Intrinsics::declare(&module, &self.ctx, &target_data, self.binary_fmt);
         let (func_type, func_attrs) =
             self.abi
                 .func_type_to_llvm(&self.ctx, &intrinsics, Some(&offsets), wasm_fn_type)?;
@@ -111,8 +126,12 @@ impl FuncTranslator {
         }
 
         func.add_attribute(AttributeLoc::Function, intrinsics.stack_probe);
+        func.add_attribute(AttributeLoc::Function, intrinsics.uwtable);
+        func.add_attribute(AttributeLoc::Function, intrinsics.frame_pointer);
+
         func.set_personality_function(intrinsics.personality);
-        func.as_global_value().set_section(Some(FUNCTION_SECTION));
+        func.as_global_value().set_section(Some(&self.func_section));
+
         func.set_linkage(Linkage::DLLExport);
         func.as_global_value()
             .set_dll_storage_class(DLLStorageClass::Export);
@@ -213,7 +232,9 @@ impl FuncTranslator {
             symbol_registry,
             abi: &*self.abi,
             config,
+            //got_cache: HashSet::new(),
         };
+
         fcg.ctx.add_func(
             func_index,
             func.as_global_value().as_pointer_value(),
@@ -275,6 +296,10 @@ impl FuncTranslator {
             )
             .unwrap();
 
+        module
+            .print_to_file("/home/edoardo/Software/Wasmer/tests/llvm/eh/obj.ll")
+            .unwrap();
+
         if let Some(ref callbacks) = config.callbacks {
             callbacks.postopt_ir(&function, &module);
         }
@@ -317,19 +342,29 @@ impl FuncTranslator {
         let mem_buf_slice = memory_buffer.as_slice();
         load_object_file(
             mem_buf_slice,
-            FUNCTION_SECTION,
+            &self.func_section,
             RelocationTarget::LocalFunc(*local_func_index),
             |name: &str| {
-                Ok(
+                Ok({
+                    let name = if matches!(self.binary_fmt, BinaryFormat::Macho) {
+                        if name.starts_with("_") {
+                            name.replacen("_", "", 1)
+                        } else {
+                            name.to_string()
+                        }
+                    } else {
+                        name.to_string()
+                    };
                     if let Some(Symbol::LocalFunction(local_func_index)) =
-                        symbol_registry.name_to_symbol(name)
+                        symbol_registry.name_to_symbol(&name)
                     {
                         Some(RelocationTarget::LocalFunc(local_func_index))
                     } else {
                         None
-                    },
-                )
+                    }
+                })
             },
+            self.binary_fmt,
         )
     }
 }
@@ -511,7 +546,7 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
     // Convert floating point vector to integer and saturate when out of range.
     // https://github.com/WebAssembly/nontrapping-float-to-int-conversions/blob/master/proposals/nontrapping-float-to-int-conversion/Overview.md
     fn trunc_sat_scalar(
-        &self,
+        &mut self,
         int_ty: IntType<'ctx>,
         lower_bound: u64, // Exclusive (least representable value)
         upper_bound: u64, // Exclusive (greatest representable value)
@@ -620,7 +655,7 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
     }
 
     fn trap_if_not_representable_as_int(
-        &self,
+        &mut self,
         lower_bound: u64, // Inclusive (not a trapping value)
         upper_bound: u64, // Inclusive (not a trapping value)
         value: FloatValue,
@@ -1462,9 +1497,24 @@ pub struct LLVMFunctionCodeGenerator<'ctx, 'a> {
     symbol_registry: &'a dyn SymbolRegistry,
     abi: &'a dyn Abi,
     config: &'a LLVM,
+    //got_cache: HashSet<String>,
 }
 
 impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
+    //fn add_fn_to_got(&mut self, func: &FunctionValue<'ctx>, name: &str) {
+    //    //let throw_intrinsic = self.intrinsics.throw.as_global_value().as_pointer_value();
+    //    if !self.got_cache.contains(name) {
+    //        let func_ptr = func.as_global_value().as_pointer_value();
+    //        let global =
+    //            self.module
+    //                .add_global(func_ptr.get_type(), Some(AddressSpace::from(1u16)), name);
+
+    //        global.set_initializer(&func_ptr);
+    //        global.set_section(Some("__DATA_CONST,__got"));
+    //        self.got_cache.insert(name.to_string());
+    //    }
+    //}
+
     fn translate_operator(&mut self, op: Operator, _source_loc: u32) -> Result<(), CompileError> {
         // TODO: remove this vmctx by moving everything into CtxType. Values
         // computed off vmctx usually benefit from caching.
@@ -1883,7 +1933,12 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
                     }
                     self.builder.position_at_end(*if_else);
                     err!(self.builder.build_unconditional_branch(*next));
-                }
+                } else if let ControlFrame::TryTable { next, .. } = &frame {
+                    self.state.pop_landingpad();
+                    if self.state.reachable {
+                        err!(self.builder.build_unconditional_branch(*next));
+                    }
+                };
 
                 self.builder.position_at_end(*frame.code_after());
                 self.state.reset_stack(&frame);
@@ -7956,7 +8011,7 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
             //     let res = self
             //         .builder
             //         .build_signed_int_to_float(v, self.intrinsics.f64x2_ty, "");
-            //     let res = err!(self.builder.build_bit_cast(res, self.intrinsics.i128_ty, ""));
+            //     let res = chck_err!(self.builder.build_bit_cast(res, self.intrinsics.i128_ty, ""));
             //     self.state.push1(res);
             // }
             // Operator::F64x2ConvertI64x2U => {
@@ -7968,7 +8023,7 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
             //     let res = self
             //         .builder
             //         .build_unsigned_int_to_float(v, self.intrinsics.f64x2_ty, "");
-            //     let res = err!(self.builder.build_bit_cast(res, self.intrinsics.i128_ty, ""));
+            //     let res = chck_err!(self.builder.build_bit_cast(res, self.intrinsics.i128_ty, ""));
             //     self.state.push1(res);
             // }
             Operator::I32ReinterpretF32 => {
@@ -11965,6 +12020,134 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
                     "",
                 ));
                 self.state.push1(cnt.try_as_basic_value().left().unwrap());
+            }
+            Operator::TryTable { try_table } => {
+                let current_block = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| CompileError::Codegen("not currently in a block".to_string()))?;
+                let catch_block = self.context.append_basic_block(self.function, "catch");
+                let can_throw_block = self.context.append_basic_block(self.function, "can_throw");
+
+                let end_block = self
+                    .context
+                    .append_basic_block(self.function, "try_table_end");
+
+
+                let end_phis = {
+                    self.builder.position_at_end(end_block);
+
+                    let phis = self
+                        .module_translation
+                        .blocktype_params_results(&try_table.ty)?
+                        .1
+                        .iter()
+                        .map(|&wp_ty| {
+                            err_nt!(wptype_to_type(wp_ty)).and_then(|wasm_ty| {
+                                type_to_llvm(self.intrinsics, wasm_ty)
+                                    .and_then(|ty| err_nt!(self.builder.build_phi(ty, "")))
+                            })
+                        })
+                        .collect::<Result<_, _>>()?;
+
+                    self.builder.position_at_end(current_block);
+                    phis
+                };
+
+                self.builder.position_at_end(current_block);
+                err!(self.builder.build_unconditional_branch(can_throw_block));
+                self.builder.position_at_end(catch_block);
+
+                let block_param_types = self
+                    .module_translation
+                    .blocktype_params_results(&try_table.ty)?
+                    .0
+                    .iter()
+                    .map(|&wp_ty| {
+                        err_nt!(wptype_to_type(wp_ty))
+                            .and_then(|wasm_ty| type_to_llvm(self.intrinsics, wasm_ty))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                // Build the landing pad.
+                let null = self.intrinsics.ptr_ty.const_zero();
+                let exception_type = self.context.struct_type(
+                    &[self.intrinsics.ptr_ty.into(), self.intrinsics.i32_ty.into()],
+                    false,
+                );
+
+                let mut clauses: Vec<BasicValueEnum<'ctx>> = vec![];
+                let mut catch_blocks = vec![];
+
+                for catch in try_table.catches.iter() {
+                    match catch {
+                        Catch::All { label } => {
+                            clauses.push(null.into());
+                        }
+                        _ => todo!(),
+                    }
+                }
+
+                err!(self.builder.build_landing_pad(
+                    exception_type,
+                    self.intrinsics.personality,
+                    &clauses,
+                    false,
+                    "try_table_lp",
+                ));
+
+                // Todo: build the jumps to the Catch labels;
+                err!(self.builder.build_return(None));
+
+                self.state.push_landingpad(catch_block);
+                // -- end
+
+                self.builder.position_at_end(can_throw_block);
+                let can_throw_phis: SmallVec<[PhiValue<'ctx>; 1]> = block_param_types
+                    .iter()
+                    .map(|&ty| err_nt!(self.builder.build_phi(ty, "")))
+                    .collect::<Result<SmallVec<_>, _>>()?;
+
+                for phi in can_throw_phis.iter() {
+                    self.state.push1(phi.as_basic_value());
+                }
+
+                self.state
+                    .push_try_table(can_throw_block, can_throw_phis, end_block, end_phis);
+            }
+            Operator::Throw { .. } => {
+                let current_block = self
+                    .builder
+                    .get_insert_block()
+                    .ok_or_else(|| CompileError::Codegen("not currently in a block".to_string()))?;
+
+                if let Some(pad) = self.state.get_landingpad() {
+                    let unreachable_block = self
+                        .context
+                        .append_basic_block(self.function, "_throw_unreachable");
+
+                    err!(self.builder.build_invoke(
+                        self.intrinsics.throw,
+                        &[self.intrinsics.i64_ty.const_zero().into()],
+                        unreachable_block,
+                        pad,
+                        "throw",
+                    ));
+
+                    self.builder.position_at_end(unreachable_block);
+                    // can't reach after an explicit throw!
+                    err!(self.builder.build_unreachable());
+
+                    self.builder.position_at_end(current_block);
+                } else {
+                    err!(self.builder.build_call(
+                        self.intrinsics.throw,
+                        &[self.intrinsics.i64_ty.const_zero().into()],
+                        "throw"
+                    ));
+                }
+
+                self.state.reachable = false;
             }
             _ => {
                 return Err(CompileError::Codegen(format!(

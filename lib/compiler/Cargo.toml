@@ -54,6 +54,9 @@ windows-sys = { version = "0.59", features = [
 	"Win32_System_Diagnostics_Debug",
 ] }
 
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+macho-unwind-info = "0.5.0"
+
 [features]
 default = ["std"]
 # This feature is for compiler implementors, it enables using `Compiler` and

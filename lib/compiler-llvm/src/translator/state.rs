@@ -3,7 +3,10 @@ use inkwell::{
     values::{BasicValue, BasicValueEnum, PhiValue},
 };
 use smallvec::SmallVec;
-use std::ops::{BitAnd, BitOr, BitOrAssign};
+use std::{
+    collections::VecDeque,
+    ops::{BitAnd, BitOr, BitOrAssign},
+};
 use wasmer_types::CompileError;
 
 #[derive(Debug)]
@@ -31,6 +34,13 @@ pub enum ControlFrame<'ctx> {
         stack_size_snapshot: usize,
         if_else_state: IfElseState,
     },
+    TryTable {
+        can_throw: BasicBlock<'ctx>,
+        next: BasicBlock<'ctx>,
+        can_throw_phis: SmallVec<[PhiValue<'ctx>; 1]>,
+        next_phis: SmallVec<[PhiValue<'ctx>; 1]>,
+        stack_size_snapshot: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -44,13 +54,16 @@ impl<'ctx> ControlFrame<'ctx> {
         match self {
             ControlFrame::Block { ref next, .. }
             | ControlFrame::Loop { ref next, .. }
+            | ControlFrame::TryTable { ref next, .. }
             | ControlFrame::IfElse { ref next, .. } => next,
         }
     }
 
     pub fn br_dest(&self) -> &BasicBlock<'ctx> {
         match self {
-            ControlFrame::Block { ref next, .. } | ControlFrame::IfElse { ref next, .. } => next,
+            ControlFrame::Block { ref next, .. }
+            | ControlFrame::IfElse { ref next, .. }
+            | ControlFrame::TryTable { ref next, .. } => next,
             ControlFrame::Loop { ref body, .. } => body,
         }
     }
@@ -60,17 +73,18 @@ impl<'ctx> ControlFrame<'ctx> {
             ControlFrame::Block { ref phis, .. } | ControlFrame::Loop { ref phis, .. } => {
                 phis.as_slice()
             }
-            ControlFrame::IfElse { ref next_phis, .. } => next_phis.as_slice(),
+            ControlFrame::IfElse { ref next_phis, .. }
+            | ControlFrame::TryTable { ref next_phis, .. } => next_phis.as_slice(),
         }
     }
 
     /// PHI nodes for stack values in the loop body.
     pub fn loop_body_phis(&self) -> &[PhiValue<'ctx>] {
         match self {
-            ControlFrame::Block { .. } | ControlFrame::IfElse { .. } => &[],
             ControlFrame::Loop {
                 ref loop_body_phis, ..
             } => loop_body_phis.as_slice(),
+            _ => &[],
         }
     }
 
@@ -210,6 +224,7 @@ impl BitAnd for ExtraInfo {
 pub struct State<'ctx> {
     pub stack: Vec<(BasicValueEnum<'ctx>, ExtraInfo)>,
     control_stack: Vec<ControlFrame<'ctx>>,
+    landingpads: VecDeque<BasicBlock<'ctx>>,
 
     pub reachable: bool,
 }
@@ -220,6 +235,7 @@ impl<'ctx> State<'ctx> {
             stack: vec![],
             control_stack: vec![],
             reachable: true,
+            landingpads: VecDeque::new(),
         }
     }
 
@@ -238,6 +254,10 @@ impl<'ctx> State<'ctx> {
                 ..
             }
             | ControlFrame::IfElse {
+                stack_size_snapshot,
+                ..
+            }
+            | ControlFrame::TryTable {
                 stack_size_snapshot,
                 ..
             } => *stack_size_snapshot,
@@ -440,5 +460,33 @@ impl<'ctx> State<'ctx> {
             stack_size_snapshot: self.stack.len(),
             if_else_state: IfElseState::If,
         });
+    }
+
+    pub fn push_try_table(
+        &mut self,
+        can_throw: BasicBlock<'ctx>,
+        can_throw_phis: SmallVec<[PhiValue<'ctx>; 1]>,
+        next: BasicBlock<'ctx>,
+        next_phis: SmallVec<[PhiValue<'ctx>; 1]>,
+    ) {
+        self.control_stack.push(ControlFrame::TryTable {
+            can_throw,
+            can_throw_phis,
+            next,
+            next_phis,
+            stack_size_snapshot: self.stack.len(),
+        });
+    }
+
+    pub(crate) fn get_landingpad(&mut self) -> Option<BasicBlock<'ctx>> {
+        self.landingpads.back().cloned()
+    }
+
+    pub(crate) fn push_landingpad(&mut self, catch: BasicBlock<'ctx>) {
+        self.landingpads.push_back(catch)
+    }
+
+    pub(crate) fn pop_landingpad(&mut self) -> bool {
+        self.landingpads.pop_back().is_some()
     }
 }

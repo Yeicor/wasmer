@@ -142,9 +142,14 @@ impl VMBuiltinFunctionIndex {
         Self(29)
     }
 
+    /// Returns an index for wasm's imported `throw` builtin function.
+    pub const fn get_imported_throw_index() -> Self {
+        Self(30)
+    }
+
     /// Returns the total number of builtin functions.
     pub const fn builtin_functions_total_number() -> u32 {
-        30
+        31
     }
 
     /// Return the index as an u32 number.
