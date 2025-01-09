@@ -5,8 +5,6 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
-use _apple_uw::generate_find_dynamic_unwind_sections;
-
 use crate::types::unwind::CompiledFunctionUnwindInfoReference;
 
 /// Represents a registry of function unwind information for System V ABI.
@@ -265,14 +263,18 @@ impl UnwindRegistry {
         &self,
         compact_unwind: Option<(wasmer_vm::SectionBodyPtr, usize)>,
     ) -> Result<(), String> {
-        if let Some((ptr, len)) = compact_unwind {
-            if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-                unsafe {
-                    _apple_uw::__unw_add_find_dynamic_unwind_sections(
-                        generate_find_dynamic_unwind_sections((*ptr) as usize, len),
-                    );
-                }
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        unsafe {
+            if let Some((ptr, len)) = compact_unwind {
+                _apple_uw::__unw_add_find_dynamic_unwind_sections(
+                    _apple_uw::generate_find_dynamic_unwind_sections((*ptr) as usize, len),
+                );
             }
+        }
+
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            _ = compact_unwind;
         }
         Ok(())
     }
