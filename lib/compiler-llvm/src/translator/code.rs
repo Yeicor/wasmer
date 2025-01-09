@@ -115,7 +115,7 @@ impl FuncTranslator {
 
         // TODO: pointer width
         let offsets = VMOffsets::new(8, wasm_module);
-        let intrinsics = Intrinsics::declare(&module, &self.ctx, &target_data, self.binary_fmt);
+        let intrinsics = Intrinsics::declare(&module, &self.ctx, &target_data);
         let (func_type, func_attrs) =
             self.abi
                 .func_type_to_llvm(&self.ctx, &intrinsics, Some(&offsets), wasm_fn_type)?;
@@ -257,9 +257,13 @@ impl FuncTranslator {
 
         let mut passes = vec![];
 
-        if config.enable_verifier {
-            passes.push("verify");
-        }
+        module
+            .print_to_file("/home/edoardo/Software/Wasmer/tests/llvm/eh/obj_unv.ll")
+            .unwrap();
+
+        //if config.enable_verifier {
+        passes.push("verify");
+        // }
 
         passes.push("sccp");
         passes.push("early-cse");
@@ -1917,7 +1921,9 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
                         phi.add_incoming(&[(&value, current_block)]);
                     }
 
-                    err!(self.builder.build_unconditional_branch(*frame.code_after()));
+                    dbg!(err!(self
+                        .builder
+                        .build_unconditional_branch(*frame.code_after())));
                 }
 
                 if let ControlFrame::IfElse {
@@ -1933,11 +1939,8 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
                     }
                     self.builder.position_at_end(*if_else);
                     err!(self.builder.build_unconditional_branch(*next));
-                } else if let ControlFrame::TryTable { next, .. } = &frame {
+                } else if let ControlFrame::TryTable { .. } = &frame {
                     self.state.pop_landingpad();
-                    if self.state.reachable {
-                        err!(self.builder.build_unconditional_branch(*next));
-                    }
                 };
 
                 self.builder.position_at_end(*frame.code_after());
@@ -12026,13 +12029,10 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
                     .builder
                     .get_insert_block()
                     .ok_or_else(|| CompileError::Codegen("not currently in a block".to_string()))?;
+                let can_throw_block = self.context.append_basic_block(self.function, "try_begin");
                 let catch_block = self.context.append_basic_block(self.function, "catch");
-                let can_throw_block = self.context.append_basic_block(self.function, "can_throw");
 
-                let end_block = self
-                    .context
-                    .append_basic_block(self.function, "try_table_end");
-
+                let end_block = self.context.append_basic_block(self.function, "try_end");
 
                 let end_phis = {
                     self.builder.position_at_end(end_block);
@@ -12083,21 +12083,71 @@ impl<'ctx, 'a> LLVMFunctionCodeGenerator<'ctx, 'a> {
                     match catch {
                         Catch::All { label } => {
                             clauses.push(null.into());
+                            let b = self
+                                .context
+                                .append_basic_block(self.function, "catch_clause");
+                            self.builder.position_at_end(b);
+                            let frame = self.state.frame_at_depth(*label)?;
+
+                            let current_block =
+                                self.builder.get_insert_block().ok_or_else(|| {
+                                    CompileError::Codegen("not currently in a block".to_string())
+                                })?;
+
+                            let phis = if frame.is_loop() {
+                                frame.loop_body_phis()
+                            } else {
+                                frame.phis()
+                            };
+
+                            let len = phis.len();
+                            let values = self.state.peekn_extra(len)?;
+                            let values = values
+                                .iter()
+                                .map(|(v, info)| self.apply_pending_canonicalization(*v, *info))
+                                .collect::<Result<Vec<_>, _>>()?;
+
+                            // For each result of the block we're branching to,
+                            // pop a value off the value stack and load it into
+                            // the corresponding phi.
+                            for (phi, value) in phis.iter().zip(values.into_iter()) {
+                                phi.add_incoming(&[(&value, current_block)]);
+                            }
+
+                            err!(self.builder.build_unconditional_branch(*frame.br_dest()));
+
+                            self.builder.position_at_end(catch_block);
+                            catch_blocks.push(b);
                         }
                         _ => todo!(),
                     }
                 }
 
-                err!(self.builder.build_landing_pad(
+                let res = err!(self.builder.build_landing_pad(
                     exception_type,
                     self.intrinsics.personality,
                     &clauses,
                     false,
-                    "try_table_lp",
+                    "exc",
                 ));
 
-                // Todo: build the jumps to the Catch labels;
-                err!(self.builder.build_return(None));
+                let res = res.into_struct_value();
+
+                let _exc = err!(self.builder.build_extract_value(res, 0, "exc"));
+                let exc_ty = err!(self.builder.build_extract_value(res, 1, "exc_ty"));
+
+                let exc_ty = exc_ty.into_int_value();
+
+                err!(self.builder.build_switch(
+                    exc_ty,
+                    end_block,
+                    catch_blocks
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, v)| (self.intrinsics.i32_ty.const_int(i as _, false), v))
+                        .collect::<Vec<_>>()
+                        .as_slice()
+                ));
 
                 self.state.push_landingpad(catch_block);
                 // -- end

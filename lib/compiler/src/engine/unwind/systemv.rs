@@ -72,23 +72,14 @@ mod _apple_uw {
     type UnwFindDynamicUnwindSections =
         unsafe extern "C" fn(addr: usize, info: *mut UnwDynamicUnwindSections) -> u32;
 
-    unsafe extern "C" fn x(addr: usize, info: *mut UnwDynamicUnwindSections) -> u32 {
-        0
+    unsafe extern "C" fn x(_addr: usize, _info: *mut UnwDynamicUnwindSections) -> u32 {
+        todo!()
     }
 
     pub unsafe fn generate_find_dynamic_unwind_sections(
-        addr: usize,
-        bytes: usize,
+        _addr: usize,
+        _bytes: usize,
     ) -> UnwFindDynamicUnwindSections {
-        let data =
-            std::ptr::slice_from_raw_parts(std::mem::transmute::<usize, *const u8>(addr), bytes)
-                .as_ref()
-                .unwrap();
-        let ui = macho_unwind_info::UnwindInfo::parse(data).unwrap();
-        let mut fns = ui.functions();
-        while let Ok(Some(f)) = fns.next() {
-            println!("fn: {f:?}");
-        }
         x
     }
 
