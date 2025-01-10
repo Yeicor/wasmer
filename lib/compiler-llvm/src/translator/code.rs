@@ -46,7 +46,8 @@ use wasmer_types::{
 use wasmer_vm::{MemoryStyle, TableStyle, VMOffsets};
 
 const FUNCTION_SECTION_ELF: &str = "__TEXT,wasmer_function";
-const FUNCTION_SECTION_MACHO: &str = "wasmer_function";
+const FUNCTION_SECTION_MACHO: &str = "__TEXT";
+const FUNCTION_SEGMENT_MACHO: &str = "__text";
 
 pub struct FuncTranslator {
     ctx: Context,
@@ -68,7 +69,7 @@ impl FuncTranslator {
             abi,
             func_section: match binary_fmt {
                 BinaryFormat::Elf => FUNCTION_SECTION_ELF.to_string(),
-                BinaryFormat::Macho => FUNCTION_SECTION_MACHO.to_string(),
+                BinaryFormat::Macho => FUNCTION_SEGMENT_MACHO.to_string(),
                 _ => {
                     return Err(CompileError::UnsupportedTarget(format!(
                         "Unsupported binary format: {:?}",
@@ -129,8 +130,21 @@ impl FuncTranslator {
         func.add_attribute(AttributeLoc::Function, intrinsics.uwtable);
         func.add_attribute(AttributeLoc::Function, intrinsics.frame_pointer);
 
+        let section = match self.binary_fmt {
+            BinaryFormat::Elf => FUNCTION_SECTION_ELF.to_string(),
+            BinaryFormat::Macho => {
+                format!("{FUNCTION_SECTION_MACHO},{FUNCTION_SEGMENT_MACHO}")
+            }
+            _ => {
+                return Err(CompileError::UnsupportedTarget(format!(
+                    "Unsupported binary format: {:?}",
+                    self.binary_fmt
+                )))
+            }
+        };
+
         func.set_personality_function(intrinsics.personality);
-        func.as_global_value().set_section(Some(&self.func_section));
+        func.as_global_value().set_section(Some(&section));
 
         func.set_linkage(Linkage::DLLExport);
         func.as_global_value()
@@ -257,8 +271,12 @@ impl FuncTranslator {
 
         let mut passes = vec![];
 
+        // cut
         module
-            .print_to_file("/home/edoardo/Software/Wasmer/tests/llvm/eh/obj_unv.ll")
+            .print_to_file(format!(
+                "{}/obj_unv.ll",
+                std::env!("LLVM_EH_TESTS_DUMP_DIR")
+            ))
             .unwrap();
 
         //if config.enable_verifier {
@@ -301,7 +319,7 @@ impl FuncTranslator {
             .unwrap();
 
         module
-            .print_to_file("/home/edoardo/Software/Wasmer/tests/llvm/eh/obj.ll")
+            .print_to_file(format!("{}/obj.ll", std::env!("LLVM_EH_TESTS_DUMP_DIR")))
             .unwrap();
 
         if let Some(ref callbacks) = config.callbacks {
@@ -337,6 +355,17 @@ impl FuncTranslator {
         let target_machine = &self.target_machine;
         let memory_buffer = target_machine
             .write_to_memory_buffer(&module, FileType::Object)
+            .unwrap();
+
+        target_machine
+            .write_to_file(
+                &module,
+                FileType::Assembly,
+                std::path::Path::new(&format!(
+                    "{}/obj.asm",
+                    std::env!("LLVM_EH_TESTS_DUMP_DIR")
+                )),
+            )
             .unwrap();
 
         if let Some(ref callbacks) = config.callbacks {

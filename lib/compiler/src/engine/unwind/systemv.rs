@@ -77,9 +77,17 @@ mod _apple_uw {
     }
 
     pub unsafe fn generate_find_dynamic_unwind_sections(
-        _addr: usize,
-        _bytes: usize,
+        ptr: usize,
+        len: usize,
     ) -> UnwFindDynamicUnwindSections {
+        let bytes = std::slice::from_raw_parts(std::mem::transmute::<usize, *const u8>(ptr), len);
+        let p = macho_unwind_info::UnwindInfo::parse(bytes).unwrap();
+        let mut funcs = p.functions();
+
+        while let Ok(Some(f)) = funcs.next() {
+            println!("{f:?}");
+        }
+
         x
     }
 

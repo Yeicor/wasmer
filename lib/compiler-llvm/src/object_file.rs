@@ -145,7 +145,8 @@ where
         .write(true)
         .create(true)
         .open(format!(
-            "/Users/edoardo/Software/Wasmer/tests/llvm/eh/obj_{root_section}"
+            "{}/obj_{root_section}.o",
+            std::env!("LLVM_EH_TESTS_DUMP_DIR")
         ))
         .unwrap();
     fs.write_all(contents).unwrap();
