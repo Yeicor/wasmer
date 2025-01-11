@@ -219,7 +219,7 @@ sys-default = [
 ]
 sys-poll = []
 extra-logging = []
-sys-thread = ["tokio/rt", "tokio/time", "tokio/rt-multi-thread", "rusty_pool"]
+sys-thread = ["tokio/rt", "tokio/time", "rusty_pool"]
 journal = ["tokio/fs", "wasmer-journal/log-file"]
 
 # Deprecated. Kept it for compatibility
@@ -233,6 +233,7 @@ js = [
 	"wasm-bindgen",
 	"wasm-bindgen-futures",
 	"web-sys",
+	"sys-thread",
 ]
 js-default = ["js"]
 test-js = ["js", "wasmer/wat"]
