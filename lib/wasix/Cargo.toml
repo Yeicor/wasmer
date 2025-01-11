@@ -233,7 +233,6 @@ js = [
 	"wasm-bindgen",
 	"wasm-bindgen-futures",
 	"web-sys",
-	"sys-thread",
 ]
 js-default = ["js"]
 test-js = ["js", "wasmer/wat"]
